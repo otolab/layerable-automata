@@ -1,8 +1,14 @@
+import { promisify } from 'util';
+
+const wait = promisify(setTimeout);
+
 export type StateHandler<Cargo> = (
-  message: Message,
+  event: Event,
   cargo: Cargo
 ) => Promise<string | undefined | void> | string | undefined | void;
+
 export type OnTransitionHandler<Cargo> = (to: string, from: string, cargo: Cargo) => void;
+
 interface StateOptions<Cargo> {
   onTransition?: OnTransitionHandler<Cargo>;
 }
@@ -11,15 +17,15 @@ export class State<Cargo> {
   handler: StateHandler<Cargo>;
   onTransitionHandler: OnTransitionHandler<Cargo> | undefined;
 
-  constructor(handler: StateHandler<Cargo>, options: StateOptions<Cargo>) {
+  constructor(handler: StateHandler<Cargo>, options?: StateOptions<Cargo>) {
     this.handler = handler;
-    const { onTransition }: StateOptions<Cargo> = options;
+    const { onTransition }: StateOptions<Cargo> = options || {};
 
     this.onTransitionHandler = onTransition;
   }
 
-  async run(message: Message, cargo: any) {
-    return this.handler(message, cargo);
+  async run(event: Event, cargo: any) {
+    return this.handler(event, cargo);
   }
 }
 
@@ -35,40 +41,41 @@ interface System<Cargo> {
   [key: string]: State<Cargo>;
 }
 
-interface Message {
-  type: string;
-  name: string;
-  data: any;
+interface Event {
+  type?: string;
+  name?: string;
+  data?: any;
 }
 
 export class Automata<Cargo> {
   systems: { [key: string]: System<Cargo> } = {};
   contexts: Context<Cargo>[] = [];
-  messages: Message[] = [];
+  events: Event[] = [];
   onUpdateContexts: UpdateContextsHandler | null = null;
-  _messageIter: AsyncGenerator<Message, void, unknown>;
+  _eventIter: AsyncGenerator<Event, void, unknown>;
+  debug: boolean = false;
   latestTransition: number;
   CargoClass: { new (): Cargo };
 
   constructor(CargoClass: { new (): Cargo }) {
-    const { messages } = this;
+    const { events } = this;
 
     this.CargoClass = CargoClass;
 
     // イベントの取得。このへんstreamで実装してもいいのかもな..
     async function* gen(time: number) {
       // イベントの発生がもうない場合にはfunctionを終了し、done: trueを返すことができる
-      // Automataの外部からmessageが供給されうるので、終了は判断できないか?
+      // Automataの外部からeventが供給されうるので、終了は判断できないか?
       while (true) {
         // FIFOなのでshift
-        const message = messages.shift();
-        if (message) {
-          yield message;
+        const event = events.shift();
+        if (event) {
+          yield event;
         }
         await new Promise((resolve) => setTimeout(resolve, time));
       }
     }
-    this._messageIter = gen(30);
+    this._eventIter = gen(30);
     this.latestTransition = Date.now();
   }
 
@@ -81,9 +88,8 @@ export class Automata<Cargo> {
     this.onUpdateContexts();
   }
 
-  pushMessage(message: Message) {
-    // console.log('push message', message);
-    this.messages.push(message);
+  pushEvent(event?: Event) {
+    this.events.push(event || {});
   }
 
   registerSystem(name: string, system: System<Cargo>) {
@@ -92,6 +98,10 @@ export class Automata<Cargo> {
 
   getContext(systemName: string) {
     return this.contexts.find((context) => context.system == systemName);
+  }
+
+  isRecentSystem(systemName: string): boolean {
+    return systemName === this.contexts[this.contexts.length - 1]?.system;
   }
 
   pushContext(systemName: string) {
@@ -109,20 +119,21 @@ export class Automata<Cargo> {
 
     this._onUpdateContexts();
 
-    this.pushMessage({ type: 'automata', name: 'entered', data: { systemName } });
+    this.log(`initialize: ${systemName}`);
+    this.pushEvent({ type: 'automata', name: 'entered', data: { systemName } });
   }
 
   async _finalizeContext(context: Context<Cargo>) {
     const { cargo, system } = context;
     const finalizeState = this.systems[system]['@finalize'];
     if (finalizeState) {
-      const finializeMessage = {
+      const finializeEvent = {
         type: 'automata',
         name: 'finalize',
         data: { context },
       };
       this.log(`finalize: ${system}`);
-      await finalizeState.run(finializeMessage, cargo);
+      await finalizeState.run(finializeEvent, cargo);
     }
   }
 
@@ -142,19 +153,32 @@ export class Automata<Cargo> {
   }
 
   log(msg: string) {
-    console.log('automata:', msg);
+    if (this.debug) {
+      console.log('automata:', msg);
+    }
   }
 
   async _transitionTo(stateName: string, context: Context<Cargo>) {
     // 終了stateへの遷移
     if (stateName === '@end') {
+      // 明示的な終了を表すイベントとして@end stateを実行
+      const endState = this.systems[context.system]['@end'];
+      if (endState) {
+        const finializeEvent = {
+          type: 'automata',
+          name: 'end',
+          data: { context },
+        };
+        this.log(`end: ${context.system}`);
+        await endState.run(finializeEvent, context.cargo);
+      }
+
       // 自身をcontextsから削除
       const self = this.contexts.pop();
       if (!self) return false;
       await this._finalizeContext(self);
 
       this._onUpdateContexts();
-      this.pushMessage({ type: 'automata', name: 'leaved', data: { systemName: self.system, cargo: self.cargo } });
 
       this.log(`leave: ${self.system}`);
       return true;
@@ -171,12 +195,6 @@ export class Automata<Cargo> {
       }
 
       this._onUpdateContexts();
-
-      this.pushMessage({
-        type: 'automata',
-        name: 'transitioned',
-        data: { from: context.currentState, to: context.currentState, systemName: context.system },
-      });
 
       this.log(`re-transition: ${context.system}`);
     }
@@ -207,7 +225,6 @@ export class Automata<Cargo> {
       // 新しく指定のsystemのcontextを作成
       this.pushContext(systemName);
 
-      this.pushMessage({ type: 'automata', name: 'transitioned', data: { systemName } });
       this.log(`enter(${context.system}): => #${systemName}`);
     }
 
@@ -224,12 +241,6 @@ export class Automata<Cargo> {
       this.log(`transition(${context.system}): ${context.currentState} => ${stateName}`);
 
       context.currentState = stateName;
-
-      this.pushMessage({
-        type: 'automata',
-        name: 'transitioned',
-        data: { from: context.currentState, to: stateName, systemName: context.system },
-      });
     }
 
     // watch対象の更新
@@ -239,20 +250,20 @@ export class Automata<Cargo> {
   }
 
   async do() {
-    const { value: message } = await this._messageIter.next();
-    if (!message) return this.contexts.length > 0;
+    const { value: event } = await this._eventIter.next();
+    if (!event) return this.contexts.length > 0;
 
     for (const context of this.contexts) {
       const { system, currentState, cargo } = context;
       const state = this.systems[system][currentState];
 
       // 遷移イベントは発生したcontextのみに発生している
-      if (message.type == 'automata' && message.name == 'transition' && message.data.systemName != context.system) {
+      if (event.type == 'automata' && event.name == 'transition' && event.data.systemName != context.system) {
         continue;
       }
 
       // stateの処理
-      const nextStateName = await state.run(message, cargo);
+      const nextStateName = await state.run(event, cargo);
 
       if (nextStateName) {
         // 遷移する
@@ -268,5 +279,11 @@ export class Automata<Cargo> {
       }
     }
     return this.contexts.length > 0;
+  }
+
+  async start(time = 100) {
+    while (await this.do()) {
+      await wait(time);
+    }
   }
 }
